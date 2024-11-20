@@ -24,6 +24,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"time"
 
 	barmanArchiver "github.com/cloudnative-pg/barman-cloud/pkg/archiver"
@@ -81,7 +82,7 @@ func NewCmd() *cobra.Command {
 				return fmt.Errorf("failed to get cluster: %w", err)
 			}
 
-			err = run(ctx, podName, pgData, cluster, args)
+			err = run(ctx, podName, pgData, cluster, args[0], false)
 			if err != nil {
 				if errors.Is(err, errSwitchoverInProgress) {
 					contextLog.Warning("Refusing to archive WALs until the switchover is not completed",
@@ -123,15 +124,52 @@ func NewCmd() *cobra.Command {
 	return &cmd
 }
 
+// EnsureAllWALArchived ensures that all WAL files are archived
+func EnsureAllWALArchived(
+	ctx context.Context,
+	cluster *apiv1.Cluster,
+	podName string,
+	pgData string,
+) error {
+	noWAL := errors.New("no wal files to archive")
+
+	iterator := func() error {
+		walList := gatherWALFiles(ctx)
+		if len(walList) == 0 {
+			return noWAL
+		}
+
+		return run(ctx, podName, pgData, cluster, walList[0], true)
+	}
+
+	for {
+		if err := iterator(); err != nil {
+			if errors.Is(err, noWAL) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func gatherWALFiles(ctx context.Context) []string {
+	var walArchiver barmanArchiver.WALArchiver
+	walList := walArchiver.GatherWALFilesToArchive(ctx, "", 10)
+	walList = slices.DeleteFunc(walList, func(s string) bool {
+		return s == ""
+	})
+	return walList
+}
+
 func run(
 	ctx context.Context,
 	podName, pgData string,
 	cluster *apiv1.Cluster,
-	args []string,
+	walName string,
+	force bool,
 ) error {
 	startTime := time.Now()
 	contextLog := log.FromContext(ctx)
-	walName := args[0]
 
 	if cluster.IsReplica() {
 		if podName != cluster.Status.CurrentPrimary && podName != cluster.Status.TargetPrimary {
@@ -146,7 +184,7 @@ func run(
 		}
 	}
 
-	if cluster.Status.CurrentPrimary != podName {
+	if !force && cluster.Status.CurrentPrimary != podName {
 		contextLog.Info("Refusing to archive WAL when there is a switchover in progress",
 			"currentPrimary", cluster.Status.CurrentPrimary,
 			"targetPrimary", cluster.Status.TargetPrimary,
